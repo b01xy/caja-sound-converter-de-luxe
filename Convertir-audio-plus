@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# Convertir audio — script Caja (MATE) basé sur ffmpeg + zenity
+#
+# Formats de sortie : MP3, Ogg Vorbis, Opus, FLAC, WAV
+# - sélection multiple dans Caja (traitement par lot)
+# - choix du niveau de compression (débit / qualité) selon le format
+# - texte personnalisé ajouté à la fin du nom (avant l'extension)
+# - option : normalisation du volume (loudnorm EBU R128 ou normalisation des crêtes)
+# - option : conservation de la pochette d'album (MP3 et FLAC)
+# - option : choix du dossier de sortie
+# - les fichiers existants ne sont jamais écrasés (numérotation _1, _2…)
+#
+# Installation :
+#   mkdir -p ~/.config/caja/scripts
+#   cp "Convertir audio" ~/.config/caja/scripts/
+#   chmod +x ~/.config/caja/scripts/"Convertir audio"
+# Utilisation : sélectionner des fichiers → clic droit → Scripts → Convertir audio
+# Dépendances : ffmpeg + ffprobe (avec libmp3lame, libvorbis, libopus, flac), zenity, awk
+# ---------------------------------------------------------------------------
+
+set -u
+trap '' PIPE                      # on gère nous-mêmes la fermeture de la barre de progression
+
+TITLE="Convertir audio"
+DEFAULT_SUFFIX="_converti"
+PEAK_TARGET="-1.0"                # niveau cible (dBFS) de la normalisation des crêtes
+
+# ---------- utilitaires -----------------------------------------------------
+
+die() {
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --no-markup --title="$TITLE" --text="$1" 2>/dev/null
+    else
+        echo "$1" >&2
+    fi
+    exit 1
+}
+
+info() {
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -i audio-x-generic "$TITLE" "$1"
+    else
+        zenity --info --no-markup --timeout=8 --title="$TITLE" --text="$1" 2>/dev/null
+    fi
+}
+
+esc() {                           # échappement pango pour le texte de la barre de progression
+    local s=${1//&/&amp;}
+    s=${s//</&lt;}
+    s=${s//>/&gt;}
+    printf '%s' "$s"
+}
+
+have_enc() {                      # have_enc <encodeur ffmpeg>
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE "^ [A-Z.]{6} $1[[:space:]]"
+}
+
+unique_out() {                    # unique_out <dossier> <nom sans extension> <extension>
+    local dir=$1 name=$2 ext=$3 out n=1
+    out="$dir/$name.$ext"
+    while [ -e "$out" ]; do
+        out="$dir/${name}_$n.$ext"
+        n=$((n + 1))
+    done
+    printf '%s' "$out"
+}
+
+cover_index() {                   # index du flux « pochette » (attached_pic), vide si absent
+    ffprobe -v error -select_streams v \
+            -show_entries stream=index:stream_disposition=attached_pic \
+            -of csv=p=0 "$1" 2>/dev/null | awk -F, '$2 == 1 { print $1; exit }'
+}
+
+zen() { { printf '%s\n' "$1" >&3; } 2>/dev/null; }   # échoue si la fenêtre de progression est fermée
+
+# run_job <fichier_stderr> <commande…> : exécute en tâche de fond et surveille le bouton Annuler.
+# Positionne cancelled=1 si l'utilisateur annule ; renvoie le code de sortie de la commande.
+run_job() {
+    local ef=$1 pid
+    shift
+    "$@" >/dev/null 2>"$ef" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if ! zen "$msg"; then
+            kill "$pid" 2>/dev/null
+            cancelled=1
+            break
+        fi
+        sleep 0.4
+    done
+    wait "$pid" 2>/dev/null
+}
+
+# ---------- dépendances -----------------------------------------------------
+
+command -v zenity >/dev/null 2>&1 || { echo "zenity est requis (sudo apt install zenity)" >&2; exit 1; }
+command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg est introuvable.
+Installez-le, par exemple : sudo apt install ffmpeg"
+command -v ffprobe >/dev/null 2>&1 || die "ffprobe est introuvable (il est normalement fourni avec ffmpeg)."
+command -v awk >/dev/null 2>&1 || die "awk est introuvable."
+
+# ---------- fichiers sélectionnés ------------------------------------------
+
+raw=()
+if [ $# -gt 0 ]; then
+    raw=("$@")
+else
+    list="${CAJA_SCRIPT_SELECTED_FILE_PATHS:-${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}}"
+    while IFS= read -r line; do
+        [ -n "$line" ] && raw+=("$line")
+    done <<< "$list"
+fi
+
+files=()
+for f in "${raw[@]}"; do
+    [ -f "$f" ] || continue
+    [[ $f == /* ]] || f="$PWD/$f"     # chemin absolu (évite aussi les noms commençant par « - »)
+    files+=("$f")
+done
+total=${#files[@]}
+[ "$total" -gt 0 ] || die "Aucun fichier local sélectionné.
+(Les dossiers et les emplacements distants ne sont pas pris en charge.)"
+
+# ---------- 1) choix du format ---------------------------------------------
+
+rows=()
+sel=TRUE
+add_row() { rows+=("$sel" "$1" "$2"); sel=FALSE; }
+
+have_enc libmp3lame && add_row mp3  "MP3 (libmp3lame) — compatible partout"
+have_enc libvorbis  && add_row ogg  "Ogg Vorbis — libre, bon rapport qualité/taille"
+have_enc libopus    && add_row opus "Opus — très efficace à bas débit"
+have_enc flac       && add_row flac "FLAC — sans perte, fichiers compressés"
+add_row wav "WAV (PCM) — sans compression"
+
+fmt=$(zenity --list --radiolist --title="$TITLE" \
+        --text="$total fichier(s) sélectionné(s)"$'\n\n'"Format de sortie :" \
+        --column="" --column="Format" --column="Description" \
+        "${rows[@]}" --print-column=2 --width=500 --height=360 2>/dev/null) || exit 0
+[ -n "$fmt" ] || exit 0
+
+# ---------- 2) niveau de compression ---------------------------------------
+
+case "$fmt" in
+    mp3)
+        qtext="Niveau de compression MP3 (débit) :"
+        qrows=(
+            FALSE b320 "320 kbps — qualité maximale (CBR)"
+            FALSE b256 "256 kbps — très haute qualité (CBR)"
+            TRUE  b192 "192 kbps — haute qualité (CBR)"
+            FALSE b160 "160 kbps (CBR)"
+            FALSE b128 "128 kbps — standard (CBR)"
+            FALSE b96  "96 kbps (CBR)"
+            FALSE b64  "64 kbps — voix, taille minimale (CBR)"
+            FALSE v0   "VBR V0 — ≈ 245 kbps, qualité maximale variable"
+            FALSE v2   "VBR V2 — ≈ 190 kbps, excellent compromis"
+            FALSE v4   "VBR V4 — ≈ 165 kbps"
+        )
+        ;;
+    ogg)
+        qtext="Qualité Ogg Vorbis (-q) :"
+        qrows=(
+            FALSE q10 "q10 — ≈ 500 kbps, maximum"
+            FALSE q8  "q8 — ≈ 256 kbps"
+            FALSE q6  "q6 — ≈ 192 kbps"
+            TRUE  q5  "q5 — ≈ 160 kbps, standard"
+            FALSE q4  "q4 — ≈ 128 kbps"
+            FALSE q3  "q3 — ≈ 112 kbps"
+            FALSE q2  "q2 — ≈ 96 kbps"
+            FALSE q0  "q0 — ≈ 64 kbps, taille minimale"
+        )
+        ;;
+    opus)
+        qtext="Niveau de compression Opus (débit) :"
+        qrows=(
+            FALSE b256 "256 kbps — musique, qualité maximale"
+            FALSE b192 "192 kbps"
+            FALSE b160 "160 kbps"
+            TRUE  b128 "128 kbps — standard (transparent)"
+            FALSE b96  "96 kbps"
+            FALSE b64  "64 kbps — voix / podcasts"
+            FALSE b48  "48 kbps"
+            FALSE b32  "32 kbps — voix, taille minimale"
+        )
+        ;;
+    flac)
+        qtext="Niveau de compression FLAC (sans perte : la qualité est identique,"$'\n'"seuls la taille du fichier et le temps de calcul changent) :"
+        qrows=(
+            FALSE c0  "0 — le plus rapide, fichiers plus gros"
+            FALSE c3  "3 — rapide"
+            TRUE  c5  "5 — standard (défaut)"
+            FALSE c8  "8 — compression maximale usuelle"
+            FALSE c12 "12 — compression extrême (très lent, gain minime)"
+        )
+        ;;
+    wav)
+        qtext="Profondeur d'échantillonnage WAV (pas de compression) :"
+        qrows=(
+            TRUE  p16 "16 bits — qualité CD"
+            FALSE p24 "24 bits — studio"
+            FALSE f32 "32 bits flottant"
+        )
+        ;;
+    *) exit 1 ;;
+esac
+
+q=$(zenity --list --radiolist --title="$TITLE" --text="$qtext" \
+        --column="" --column="Valeur" --column="Niveau" \
+        "${qrows[@]}" --hide-column=2 --print-column=2 \
+        --width=520 --height=420 2>/dev/null) || exit 0
+[ -n "$q" ] || exit 0
+
+codec=()
+ext=$fmt
+case "$fmt:$q" in
+    mp3:b*)   codec=(-c:a libmp3lame -b:a "${q#b}k" -id3v2_version 3) ;;
+    mp3:v*)   codec=(-c:a libmp3lame -q:a "${q#v}"  -id3v2_version 3) ;;
+    ogg:q*)   codec=(-c:a libvorbis  -q:a "${q#q}") ;;
+    opus:b*)  codec=(-c:a libopus    -b:a "${q#b}k" -vbr on) ;;
+    flac:c*)  codec=(-c:a flac -compression_level "${q#c}") ;;
+    wav:p16)  codec=(-c:a pcm_s16le) ;;
+    wav:p24)  codec=(-c:a pcm_s24le) ;;
+    wav:f32)  codec=(-c:a pcm_f32le) ;;
+    *) die "Combinaison format/qualité inconnue : $fmt / $q" ;;
+esac
+
+# ---------- 3) options supplémentaires --------------------------------------
+
+optrows=(FALSE norm "Normaliser le volume")
+case "$fmt" in
+    mp3|flac) optrows+=(TRUE cover "Conserver la pochette d'album (si présente)") ;;
+esac
+optrows+=(FALSE dest "Choisir le dossier de sortie")
+
+opts=$(zenity --list --checklist --separator=" " --title="$TITLE" \
+        --text="Options supplémentaires :" \
+        --column="" --column="Option" --column="Description" \
+        "${optrows[@]}" --hide-column=2 --print-column=2 \
+        --width=500 --height=300 2>/dev/null) || exit 0
+has_opt() { [[ " $opts " == *" $1 "* ]]; }
+
+# 3a) normalisation du volume
+norm=""
+if has_opt norm; then
+    norm=$(zenity --list --radiolist --title="$TITLE" \
+            --text="Méthode de normalisation du volume :" \
+            --column="" --column="Valeur" --column="Méthode" \
+            FALSE ln14 "Loudness −14 LUFS — streaming (YouTube, Spotify)" \
+            TRUE  ln16 "Loudness −16 LUFS — podcasts, bon compromis" \
+            FALSE ln23 "Loudness −23 LUFS — norme EBU R128 (radio / TV)" \
+            FALSE pk   "Crêtes à $PEAK_TARGET dBFS — gain constant, dynamique inchangée" \
+            --hide-column=2 --print-column=2 --width=560 --height=300 2>/dev/null) || exit 0
+    [ -n "$norm" ] || exit 0
+fi
+
+keep_cover=0
+has_opt cover && keep_cover=1
+
+# 3b) texte ajouté à la fin du nom
+suffix=$(zenity --entry --title="$TITLE" \
+        --text="Texte à ajouter à la fin du nom du fichier converti"$'\n'"(avant l'extension). Laisser vide pour ne rien ajouter :" \
+        --entry-text="$DEFAULT_SUFFIX" --width=460 2>/dev/null) || exit 0
+suffix=${suffix//\//_}            # pas de "/" dans un nom de fichier
+
+# 3c) dossier de sortie (vide = même dossier que chaque fichier source)
+outdir=""
+if has_opt dest; then
+    first_dir=$(dirname -- "${files[0]}")
+    outdir=$(zenity --file-selection --directory --title="Dossier de sortie" \
+            --filename="$first_dir/" 2>/dev/null) || exit 0
+    [ -d "$outdir" ] && [ -w "$outdir" ] || die "Le dossier de sortie n'est pas accessible en écriture :
+$outdir"
+fi
+
+# ---------- 4) conversion par lot -------------------------------------------
+
+tmpd=$(mktemp -d) || die "Impossible de créer un dossier temporaire."
+errf="$tmpd/ffmpeg.err"
+measf="$tmpd/measure.err"
+trap 'rm -rf "$tmpd"' EXIT
+
+exec 3> >(zenity --progress --title="$TITLE" --text="Préparation…" \
+            --percentage=0 --auto-close --width=460 2>/dev/null)
+
+ok=0; fail=0; cancelled=0; errors=""; msg=""
+i=0
+for src in "${files[@]}"; do
+    i=$((i + 1))
+    dir=${outdir:-$(dirname -- "$src")}
+    base=$(basename -- "$src")
+    name=${base%.*}
+    [ -n "$name" ] || name=$base
+    out=$(unique_out "$dir" "$name$suffix" "$ext")
+
+    msg="# ($i/$total) $(esc "$base")"
+    zen "$msg" || { cancelled=1; break; }
+    zen "$(( (i - 1) * 100 / total ))"
+
+    # --- filtre de normalisation ---
+    afilter=""
+    case "$norm" in
+        ln14) afilter="loudnorm=I=-14:TP=-1:LRA=11" ;;
+        ln16) afilter="loudnorm=I=-16:TP=-1.5:LRA=11" ;;
+        ln23) afilter="loudnorm=I=-23:TP=-1:LRA=7" ;;
+        pk)
+            : > "$measf"
+            run_job "$measf" ffmpeg -nostdin -hide_banner -nostats -i "$src" \
+                    -map 0:a:0 -af volumedetect -f null -
+            if [ "$cancelled" = 1 ]; then break; fi
+            maxvol=$(sed -n 's/.*max_volume: \(-\{0,1\}[0-9.]*\) dB.*/\1/p' "$measf" | tail -n1)
+            if [ -z "$maxvol" ]; then
+                fail=$((fail + 1))
+                errors+="• $base : impossible de mesurer le niveau sonore"$'\n'
+                continue
+            fi
+            gain=$(awk -v m="$maxvol" -v t="$PEAK_TARGET" 'BEGIN { printf "%.2f", t - m }')
+            afilter="volume=${gain}dB"
+            ;;
+    esac
+
+    # --- arguments ffmpeg ---
+    args=(-nostdin -hide_banner -loglevel error -n -i "$src" -map 0:a:0)
+
+    if [ "$keep_cover" = 1 ]; then
+        cov=$(cover_index "$src")
+        if [ -n "$cov" ]; then
+            args+=(-map "0:$cov" -c:v copy -disposition:v:0 attached_pic
+                   -metadata:s:v title="Album cover" -metadata:s:v comment="Cover (front)")
+        fi
+    fi
+
+    if [ -n "$afilter" ]; then
+        args+=(-af "$afilter")
+        if [[ $norm == ln* && $fmt != opus ]]; then
+            # loudnorm ressort en 192 kHz : on rétablit la fréquence d'origine
+            sr=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate \
+                         -of csv=p=0 "$src" 2>/dev/null | head -n1)
+            [[ $sr =~ ^[0-9]+$ ]] && args+=(-ar "$sr")
+        fi
+    fi
+
+    args+=(-map_metadata 0 "${codec[@]}" "$out")
+
+    : > "$errf"
+    run_job "$errf" ffmpeg "${args[@]}"
+    rc=$?
+
+    if [ "$cancelled" = 1 ]; then
+        rm -f -- "$out"
+        break
+    fi
+
+    if [ "$rc" -eq 0 ] && [ -s "$out" ]; then
+        ok=$((ok + 1))
+    else
+        fail=$((fail + 1))
+        rm -f -- "$out"
+        errors+="• $base : $(tail -n 2 "$errf" | tr '\n' ' ')"$'\n'
+    fi
+done
+
+[ "$cancelled" = 1 ] || zen "100"
+exec 3>&-
+sleep 0.3
+
+# ---------- 5) bilan ----------------------------------------------------------
+
+where=""
+[ -n "$outdir" ] && where=" dans $outdir"
+
+if [ "$cancelled" = 1 ]; then
+    info "Conversion annulée ($ok fichier(s) converti(s) avant l'arrêt)."
+elif [ "$fail" -gt 0 ]; then
+    zenity --error --no-markup --title="$TITLE" --width=520 \
+        --text="$ok fichier(s) converti(s)$where, $fail échec(s) :"$'\n\n'"$errors" 2>/dev/null
+else
+    info "$ok fichier(s) converti(s) en ${fmt^^}$where."
+fi
+
+exit 0
